@@ -1,0 +1,21 @@
+
+context {
+    url = "{_.api}/{_.path}"
+    api = "https://eu.httpbin.org"
+    path = "get"
+}
+
+context local {
+    api = "http://127.0.0.1"
+}
+
+def test {
+    GET "{_.url}?v=test"
+    capture state {
+        query = "{response.args.v}"
+    }
+}
+
+def test2 {
+    GET "{_.url}?foo={state.query}"
+}
