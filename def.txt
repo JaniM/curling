@@ -19,3 +19,13 @@ def test {
 def test2 {
     GET "{_.url}?foo={state.query}"
 }
+
+def post {
+    POST "{_.api}/post"
+    body json {
+        "foo": "{_.url}",
+        "baz": {
+            "asd": "fgh"
+        }
+    }
+}

@@ -1,7 +1,9 @@
 mod parser;
 use std::{collections::{HashSet, HashMap}, env::args, io::{Read, Seek}};
 
-use parser::{parse, parse_arg, AstString, AstStringPiece, Context, HttpMethod, JsonKey, JsonPath};
+use parser::{parse, parse_arg, AstString, AstStringPiece, Context, HttpMethod, JsonKey, JsonPath, JsonValue};
+
+use crate::parser::ValueKind;
 
 fn get_value<'a>(mut obj: &'a serde_json::Value, path: &JsonPath) -> Option<&'a serde_json::Value> {
     for key in &path.0 {
@@ -83,6 +85,21 @@ fn construct_context(ctxs: &[Context], enabled: HashSet<String>) -> Option<serde
     Some(map.into())
 }
 
+fn value_to_json(context: &serde_json::Value, value: &JsonValue) -> serde_json::Value {
+    match value {
+        JsonValue::String(s) => construct_string(context, s).unwrap().into(),
+        JsonValue::Object(obj) => {
+            let mut map = serde_json::Map::new();
+            for (key, value) in obj {
+                let key = construct_string(context, key).unwrap();
+                let value = value_to_json(context, value);
+                map.insert(key, value);
+            }
+            map.into()
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let data = {
         let mut file = std::fs::File::open("def.txt")?;
@@ -110,36 +127,48 @@ fn main() -> std::io::Result<()> {
         context.as_object_mut().unwrap().insert(item.0.clone(), item.1.clone());
     }
 
-    match &target.call {
+    let out = match &target.call {
         Some((HttpMethod::Get, url)) => {
             let url = construct_string(&context, url).unwrap();
-            let out = reqwest::blocking::get(url).unwrap().text().unwrap();
-            println!("{}", out);
-            let json: serde_json::Value = serde_json::from_str(&out).unwrap();
-            let c = context.as_object_mut().unwrap();
-            c.insert("response".to_string(), json);
-            for group in &target.capture {
-                println!("Group {}", group.name);
-                let s = state.as_object_mut().unwrap();
-                if !s.contains_key(&group.name) {
-                    s.insert(group.name.clone(), serde_json::Map::new().into());
+            reqwest::blocking::get(url).unwrap().text().unwrap()
+        }
+        Some((HttpMethod::Post, url)) => {
+            let url = construct_string(&context, url).unwrap();
+            let client = reqwest::blocking::Client::new();
+            let mut req = client.post(url);
+            match &target.body {
+                Some(ValueKind::Json(value)) => {
+                    let value = value_to_json(&context, value);
+                    req = req.json(&value);
                 }
-                let local = s.get_mut(&group.name).unwrap().as_object_mut().unwrap();
-                for (name, val) in &group.values {
-                    let v = construct_string(&context, val).unwrap();
-                    println!("{} = {:?}", name, v);
-                    local.insert(name.clone(), v.into());
-                }
+                None => {}
             }
-
-            state_file.rewind().unwrap();
-            state_file.set_len(0).unwrap();
-            serde_json::to_writer(&mut state_file, &state).unwrap();
-
-
+            req.send().unwrap().text().unwrap()
         }
         None => unreachable!(),
+    };
+
+    println!("{}", out);
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let c = context.as_object_mut().unwrap();
+    c.insert("response".to_string(), json);
+    for group in &target.capture {
+        println!("Group {}", group.name);
+        let s = state.as_object_mut().unwrap();
+        if !s.contains_key(&group.name) {
+            s.insert(group.name.clone(), serde_json::Map::new().into());
+        }
+        let local = s.get_mut(&group.name).unwrap().as_object_mut().unwrap();
+        for (name, val) in &group.values {
+            let v = construct_string(&context, val).unwrap();
+            println!("{} = {:?}", name, v);
+            local.insert(name.clone(), v.into());
+        }
     }
+
+    state_file.rewind().unwrap();
+    state_file.set_len(0).unwrap();
+    serde_json::to_writer(&mut state_file, &state).unwrap();
 
     Ok(())
 }

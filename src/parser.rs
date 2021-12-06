@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use chumsky::{prelude::*, Stream};
 
@@ -16,6 +16,7 @@ pub struct JsonPath(pub Vec<JsonKey>);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HttpMethod {
     Get,
+    Post,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -39,11 +40,25 @@ enum Token {
     OpenBlock,
     CloseBlock,
     Assign,
+    Colon,
+    Comma,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsonValue {
+    String(AstString),
+    Object(HashMap<AstString, JsonValue>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ValueKind {
+    Json(JsonValue),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DefAst {
     Operation(HttpMethod, AstString),
+    Body(ValueKind),
     Capture(String, Vec<CtxAst>),
 }
 
@@ -110,6 +125,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         "context" => Token::Context,
         "capture" => Token::Capture,
         "GET" => Token::HttpMethod(HttpMethod::Get),
+        "POST" => Token::HttpMethod(HttpMethod::Post),
         _ => Token::Ident(x),
     });
     let blocks = just('{')
@@ -118,7 +134,10 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let string = string_with_substitutions().map(Token::String);
     let path = just('#').ignore_then(json_path()).map(Token::JsonPath);
 
-    let ops = just('=').to(Token::Assign);
+    let ops = just('=')
+        .to(Token::Assign)
+        .or(just(':').to(Token::Colon))
+        .or(just(',').to(Token::Comma));
 
     let token = ident
         .or(string)
@@ -132,24 +151,15 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     token.repeated().then_ignore(end())
 }
 
-fn symbol() -> impl Parser<Token, String, Error = Simple<Token>> + Clone {
-    filter_map(|span, x| match x {
-        Token::Ident(x) => Ok(x),
-        _ => Err(Simple::custom(span, "Expected an identifier")),
-    })
-}
-
-fn method() -> impl Parser<Token, HttpMethod, Error = Simple<Token>> + Clone {
-    filter_map(|span, x| match x {
-        Token::HttpMethod(x) => Ok(x),
-        _ => Err(Simple::custom(span, "Expected an http method")),
-    })
-}
-
-fn string() -> impl Parser<Token, AstString, Error = Simple<Token>> + Clone {
-    filter_map(|span, x| match x {
-        Token::String(x) => Ok(x),
-        _ => Err(Simple::custom(span, "Expected a string")),
+macro_rules! select {
+    ($($p:pat $(if $guard:expr)? => $out:expr),+) => ({
+        filter_map(move |span, x| match x {
+            $($p $(if $guard)? => Ok($out)),+,
+            _ => Err(Simple::expected_input_found(span, None, Some(x))),
+        })
+    });
+    (just $($p:tt)+) => ({
+        select!($($p)+ (x) => x)
     })
 }
 
@@ -160,6 +170,11 @@ fn block<O, E: chumsky::Error<Token>>(
 }
 
 fn parser() -> impl Parser<Token, Vec<Ast>, Error = Simple<Token>> {
+    let symbol = || select!(just Token::Ident);
+    let method = || select!(just Token::HttpMethod);
+    let string = || select!(just Token::String);
+    let kw = |k| select!(Token::Ident(x) if &x == k => ());
+    
     let assign = symbol()
         .then_ignore(just(Token::Assign))
         .then(string())
@@ -174,7 +189,22 @@ fn parser() -> impl Parser<Token, Vec<Ast>, Error = Simple<Token>> {
         .then(block(assign.clone().repeated()))
         .map(|(n, s)| DefAst::Capture(n, s));
 
-    let op = req.or(capture);
+    let json_decl = recursive(|json| {
+        let pair = string().then_ignore(just(Token::Colon)).then(json);
+        let object = block(
+            pair.separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect()
+                .map(JsonValue::Object),
+        );
+        object.or(string().map(JsonValue::String))
+    });
+
+    let json_body = kw("json").ignore_then(json_decl).map(ValueKind::Json);
+
+    let body = kw("body").ignore_then(json_body).map(DefAst::Body);
+
+    let op = req.or(capture).or(body);
 
     let define = just(Token::Def)
         .ignore_then(symbol())
@@ -224,6 +254,7 @@ pub struct CaptureGroup {
 pub struct Definition {
     pub name: String,
     pub call: Option<(HttpMethod, AstString)>,
+    pub body: Option<ValueKind>,
     pub capture: Vec<CaptureGroup>,
 }
 
@@ -293,6 +324,9 @@ impl Builder {
                 }
                 def.capture.push(ctx);
             }
+            DefAst::Body(value) => {
+                def.body = Some(value);
+            }
         }
     }
 
@@ -361,6 +395,7 @@ mod test {
             builder.defs,
             vec![Definition {
                 name: "google".to_string(),
+                body: None,
                 call: Some((
                     HttpMethod::Get,
                     AstString(vec![
@@ -374,6 +409,35 @@ mod test {
                     name: "foo".to_string(),
                     values: vec![("bar".to_string(), AstString(vec![]))]
                 }]
+            }]
+        )
+    }
+
+    #[test]
+    fn post() {
+        let s = r#"
+        def foo {
+            POST "foo"
+            body json {
+                "foo": "bar",
+            }
+        }
+        "#;
+        let builder = parse(s);
+
+        assert_eq!(
+            builder.defs,
+            vec![Definition {
+                name: "foo".to_string(),
+                body: Some(ValueKind::Json(JsonValue::Object(HashMap::from([(
+                    AstString(vec![AstStringPiece::Plain("foo".to_string())]),
+                    JsonValue::String(AstString(vec![AstStringPiece::Plain("bar".to_string())]))
+                )])))),
+                call: Some((
+                    HttpMethod::Post,
+                    AstString(vec![AstStringPiece::Plain("foo".to_string())])
+                )),
+                capture: vec![]
             }]
         )
     }
