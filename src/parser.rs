@@ -32,7 +32,6 @@ pub struct AstString(pub Vec<AstStringPiece>);
 enum Token {
     Def,
     Context,
-    Capture,
     Ident(String),
     String(AstString),
     HttpMethod(HttpMethod),
@@ -123,7 +122,6 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let ident = text::ident().map(|x: String| match &*x {
         "def" => Token::Def,
         "context" => Token::Context,
-        "capture" => Token::Capture,
         "GET" => Token::HttpMethod(HttpMethod::Get),
         "POST" => Token::HttpMethod(HttpMethod::Post),
         _ => Token::Ident(x),
@@ -184,7 +182,7 @@ fn parser() -> impl Parser<Token, Vec<Ast>, Error = Simple<Token>> {
         .then(string())
         .map(|(m, s)| DefAst::Operation(m, s));
 
-    let capture = just(Token::Capture)
+    let capture = kw("capture")
         .ignore_then(symbol())
         .then(block(assign.clone().repeated()))
         .map(|(n, s)| DefAst::Capture(n, s));
