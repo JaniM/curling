@@ -1,8 +1,8 @@
 
 context {
-    url = "{_.api}/{_.path}"
     api = "https://eu.httpbin.org"
     path = "get"
+    url = "{_.api}/{_.path}"
 }
 
 context local {
